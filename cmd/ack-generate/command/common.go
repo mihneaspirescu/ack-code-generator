@@ -16,6 +16,7 @@ package command
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -31,6 +32,10 @@ import (
 	"github.com/aws-controllers-k8s/code-generator/pkg/util"
 )
 
+// svcSDKVersion holds the resolved per-service SDK version for use by
+// saveGeneratedMetadata.
+var svcSDKVersion string
+
 // resolveModelName returns the SDK model name for a service, checking the
 // generator config for an override.
 func resolveModelName(svcAlias string, cfg ackgenconfig.Config) string {
@@ -39,6 +44,19 @@ func resolveModelName(svcAlias string, cfg ackgenconfig.Config) string {
 		modelName = svcAlias
 	}
 	return modelName
+}
+
+// resolveServicePackageName returns the aws-sdk-go-v2 service package directory
+// name for a service. This is used as the per-service tag path segment, which
+// can differ from the model file name (e.g. route53's model is `route-53` but
+// its service package is `route53`). It checks the generator config's
+// package_name override and falls back to the service alias.
+func resolveServicePackageName(svcAlias string, cfg ackgenconfig.Config) string {
+	pkgName := strings.ToLower(cfg.SDKNames.Package)
+	if pkgName == "" {
+		pkgName = svcAlias
+	}
+	return pkgName
 }
 
 // loadModelWithLatestAPIVersion finds the AWS SDK for a given service alias and
@@ -115,24 +133,63 @@ func getServiceAccountName() (string, error) {
 // setupGenerator loads the generator configuration, resolves the SDK version and fetches the
 // model file
 func setupGenerator(svcAlias string) (ackgenconfig.Config, error) {
+	var cfg ackgenconfig.Config
+
+	// Mutual exclusivity: both explicit CLI flags is an error
+	if optAWSSDKGoVersion != "" && optAWSServiceSDKVersion != "" {
+		return cfg, fmt.Errorf(
+			"--aws-sdk-go-version and --aws-service-sdk-version are mutually exclusive; provide only one",
+		)
+	}
+
 	// Load generator config to resolve model name before fetching
 	cfg, err := ackgenconfig.New(optGeneratorConfigPath, ackgenerate.DefaultConfig)
 	if err != nil {
 		return cfg, err
 	}
 
+	// Load existing generation metadata (used for both per-service and core
+	// version resolution fallbacks).
+	var metadataSvcSDKVersion string
+	var metadataCoreSDKVersion string
+	existingMetadata, err := ackmetadata.LoadGenerationMetadata(
+		filepath.Join(optOutputPath, "apis"), optGenVersion,
+	)
+	if err != nil {
+		return cfg, fmt.Errorf("cannot load existing generation metadata: %v", err)
+	}
+	if existingMetadata != nil {
+		metadataSvcSDKVersion = existingMetadata.AWSServiceSDKVersion
+		metadataCoreSDKVersion = existingMetadata.AWSSDKGoVersion
+	}
+
+	// Resolve per-service SDK version from priority chain:
+	// CLI flag → metadata YAML → empty
+	svcSDKVersion = sdk.GetServiceSDKVersion(optAWSServiceSDKVersion, metadataSvcSDKVersion)
+
 	// Resolve SDK version and fetch the model file
 	fetchStart := time.Now()
-	resolvedVersion, err := sdk.GetSDKVersion(optAWSSDKGoVersion, "", optOutputPath)
-	if err != nil {
-		return cfg, err
+
+	// Exactly one version field is recorded in the generation metadata,
+	// matching whichever tag the model was fetched from. When a per-service
+	// SDK version drives the fetch, the core version is neither resolved nor
+	// recorded (EnsureModel ignores it on the per-service path); otherwise we
+	// resolve the core version and a resolution failure is fatal.
+	var resolvedVersion string
+	if svcSDKVersion == "" {
+		resolvedVersion, err = sdk.GetSDKVersion(optAWSSDKGoVersion, metadataCoreSDKVersion, optOutputPath)
+		if err != nil {
+			return cfg, err
+		}
+		resolvedVersion = sdk.EnsureSemverPrefix(resolvedVersion)
 	}
-	resolvedVersion = sdk.EnsureSemverPrefix(resolvedVersion)
 
 	modelName := resolveModelName(svcAlias, cfg)
+	svcPackageName := resolveServicePackageName(svcAlias, cfg)
+
 	ctx, cancel := sdk.ContextWithSigterm(context.Background())
 	defer cancel()
-	basePath, err := sdk.EnsureModel(ctx, optCacheDir, resolvedVersion, modelName)
+	basePath, err := sdk.EnsureModel(ctx, optCacheDir, resolvedVersion, svcPackageName, modelName, svcSDKVersion)
 	if err != nil {
 		return cfg, err
 	}
